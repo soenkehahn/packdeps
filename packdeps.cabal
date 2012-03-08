@@ -30,6 +30,7 @@ library
                    , containers                >= 0.2      && < 0.5
                    , directory                 >= 1.0      && < 1.2
                    , filepath                  >= 1.1      && < 1.4
+                   , process                   == 1.1.*
     exposed-modules: Distribution.PackDeps
     ghc-options:     -Wall
 

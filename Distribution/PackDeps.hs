@@ -1,3 +1,5 @@
+{-# language ViewPatterns #-}
+
 module Distribution.PackDeps
     ( -- * Data types
       Newest
@@ -34,10 +36,13 @@ import Data.Time (UTCTime (UTCTime), addUTCTime)
 import Data.Maybe (mapMaybe, catMaybes)
 import Control.Exception (throw)
 
+import Distribution.Compiler -- (buildCompilerFlavor)
 import Distribution.Package
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Parse
+import Distribution.PackageDescription.Configuration
 import Distribution.Version
+import Distribution.System (buildPlatform)
 import Distribution.Text
 
 import Data.Char (toLower)
@@ -56,13 +61,28 @@ import Data.List (groupBy, sortBy)
 import Data.Ord (comparing)
 import qualified Data.Set as Set
 
+import System.Process
+import Text.ParserCombinators.ReadP
+import Data.Version
+
+-- | Loads the newest 'PackInfo' for every package.
 loadNewest :: IO Newest
 loadNewest = do
     c <- getAppUserDataDirectory "cabal"
     cfg <- readFile (c </> "config")
     let repos        = reposFromConfig cfg
         tarName repo = c </> "packages" </> repo </> "00-index.tar"
-    fmap (Map.unionsWith maxVersion) . mapM (loadNewestFrom . tarName) $ repos
+    compilerId <- readCompilerId
+    fmap (Map.unionsWith maxVersion) . mapM (loadNewestFrom compilerId . tarName) $ repos
+
+readCompilerId :: IO CompilerId
+readCompilerId = do
+    output <- readProcess "ghc" ["--version"] ""
+    return $ parse output
+  where
+    parse output = case (readP_to_S parseVersion) $ last $ words output of
+        (last -> (v, "")) -> CompilerId GHC v
+        x -> error "error parsing ghc version"
 
 reposFromConfig :: String -> [String]
 reposFromConfig = map (takeWhile (/= ':'))
@@ -76,19 +96,19 @@ dropPrefix prefix s =
   then Just . drop (length prefix) $ s
   else Nothing
 
-loadNewestFrom :: FilePath -> IO Newest
-loadNewestFrom = fmap parseNewest . L.readFile
+loadNewestFrom :: CompilerId -> FilePath -> IO Newest
+loadNewestFrom ci = fmap (parseNewest ci) . L.readFile
 
-parseNewest :: L.ByteString -> Newest
-parseNewest = foldl' addPackage Map.empty . entriesToList . Tar.read
+parseNewest :: CompilerId -> L.ByteString -> Newest
+parseNewest ci = foldl' (addPackage ci) Map.empty . entriesToList . Tar.read
 
 entriesToList :: Tar.Entries Tar.FormatError -> [Tar.Entry]
 entriesToList Tar.Done = []
 entriesToList (Tar.Fail s) = throw s
 entriesToList (Tar.Next e es) = e : entriesToList es
 
-addPackage :: Newest -> Tar.Entry -> Newest
-addPackage m entry =
+addPackage :: CompilerId -> Newest -> Tar.Entry -> Newest
+addPackage compilerId m entry =
     case splitOn "/" $ Tar.fromTarPathToPosixPath (Tar.entryTarPath entry) of
         [package', versionS, _] ->
             case simpleParse versionS of
@@ -107,11 +127,12 @@ addPackage m entry =
             Tar.NormalFile bs _ ->
                  Map.insert package' PackInfo
                         { piVersion = version
-                        , piDesc = parsePackage bs
+                        , piDesc = parsePackage compilerId bs
                         , piEpoch = Tar.entryTime entry
                         } m
             _ -> m
 
+-- | Meta data for packages
 data PackInfo = PackInfo
     { piVersion :: Version
     , piDesc :: Maybe DescInfo
@@ -156,10 +177,10 @@ data DescInfo = DescInfo
     }
     deriving (Show, Read)
 
-getDescInfo :: GenericPackageDescription -> DescInfo
-getDescInfo gpd = DescInfo
+getDescInfo :: CompilerId -> GenericPackageDescription -> DescInfo
+getDescInfo compilerId gpd = DescInfo
     { diHaystack = map toLower $ author p ++ maintainer p ++ name
-    , diDeps = getDeps gpd
+    , diDeps = getDeps compilerId gpd
     , diPackage = pi'
     , diSynopsis = synopsis p
     }
@@ -167,10 +188,20 @@ getDescInfo gpd = DescInfo
     p = packageDescription gpd
     pi'@(PackageIdentifier (PackageName name) _) = package p
 
-getDeps :: GenericPackageDescription -> [Dependency]
-getDeps x = concat
-          $ maybe id ((:) . condTreeConstraints) (condLibrary x)
-          $ map (condTreeConstraints . snd) (condExecutables x)
+getDeps :: CompilerId -> GenericPackageDescription -> [Dependency]
+getDeps compilerId genericPD =
+    case finalized of
+        Right (packageDescription, _) -> buildDepends packageDescription
+  where
+    finalized :: Either [Dependency] (PackageDescription, FlagAssignment)
+    finalized = finalizePackageDescription
+        flagAssignment
+        (const True)
+        buildPlatform
+        compilerId
+        []
+        genericPD
+    flagAssignment = []
 
 checkDeps :: Newest -> DescInfo
           -> (PackageName, Version, CheckDepsRes)
@@ -209,16 +240,18 @@ getPackage :: String -> Newest -> Maybe DescInfo
 getPackage s n = Map.lookup s n >>= piDesc
 
 -- | Parse information on a package from the contents of a cabal file.
-parsePackage :: L.ByteString -> Maybe DescInfo
-parsePackage lbs =
+parsePackage :: CompilerId -> L.ByteString -> Maybe DescInfo
+parsePackage compilerId lbs =
     case parsePackageDescription $ T.unpack
        $ T.decodeUtf8With T.lenientDecode lbs of
-        ParseOk _ x -> Just $ getDescInfo x
+        ParseOk _ x -> Just $ getDescInfo compilerId x
         _ -> Nothing
 
 -- | Load a single package from a cabal file.
 loadPackage :: FilePath -> IO (Maybe DescInfo)
-loadPackage = fmap parsePackage . L.readFile
+loadPackage file = do
+    ci <- readCompilerId
+    fmap (parsePackage ci) $ L.readFile file
 
 -- | Find all of the packages matching a given search string.
 filterPackages :: String -> Newest -> [DescInfo]
